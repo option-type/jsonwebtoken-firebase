@@ -11,7 +11,6 @@ mod keys;
 #[cfg(any(test, feature = "test-helper"))]
 pub mod test_helper;
 
-
 ///
 /// Parser errors
 ///
@@ -37,10 +36,11 @@ pub struct Parser {
 }
 
 impl Parser {
-    pub const GOOGLE_CERT_URL: &'static str = "https://www.googleapis.com/oauth2/v3/certs";
+    pub const FIREBASE_CERT_URL: &'static str =
+        "https://www.googleapis.com/service_accounts/v1/jwk/securetoken@system.gserviceaccount.com";
 
     pub fn new(client_id: &str) -> Self {
-        Parser::new_with_custom_cert_url(client_id, Parser::GOOGLE_CERT_URL)
+        Parser::new_with_custom_cert_url(client_id, Parser::FIREBASE_CERT_URL)
     }
 
     pub fn new_with_custom_cert_url(client_id: &str, public_key_url: &str) -> Self {
@@ -55,7 +55,11 @@ impl Parser {
     /// Download and cache public keys from http(s) server.
     /// Use expire time header for reload keys.
     ///
-    pub async fn parse<T: DeserializeOwned>(&self, token: &str) -> Result<T, ParserError> {
+    pub async fn parse<T: DeserializeOwned>(
+        &self,
+        token: &str,
+        issuers: &[String],
+    ) -> Result<T, ParserError> {
         let mut provider = self.key_provider.lock().await;
         match jsonwebtoken::decode_header(token) {
             Ok(header) => match header.kid {
@@ -65,7 +69,7 @@ impl Parser {
                         let aud = vec![self.client_id.to_owned()];
                         let mut validation = Validation::new(Algorithm::RS256);
                         validation.set_audience(&aud);
-                        validation.set_issuer(&["https://accounts.google.com".to_string(), "accounts.google.com".to_string()]);
+                        validation.set_issuer(issuers);
                         validation.validate_exp = true;
                         validation.validate_nbf = false;
                         let result = jsonwebtoken::decode::<T>(token, &key, &validation);
@@ -89,14 +93,16 @@ impl Parser {
 mod tests {
     use jsonwebtoken::errors::ErrorKind;
 
-    use crate::ParserError;
     use crate::test_helper::{setup, TokenClaims};
+    use crate::ParserError;
 
     #[tokio::test]
     async fn should_correct() {
         let claims = TokenClaims::new();
         let (token, parser, _server) = setup(&claims);
-        let result = parser.parse::<TokenClaims>(token.as_str()).await;
+        let result = parser
+            .parse::<TokenClaims>(token.as_str(), &vec!["https://example.com".to_string()])
+            .await;
         let result = result.unwrap();
         assert_eq!(result.email, claims.email);
     }
@@ -105,7 +111,9 @@ mod tests {
     async fn should_validate_exp() {
         let claims = TokenClaims::new_expired();
         let (token, validator, _server) = setup(&claims);
-        let result = validator.parse::<TokenClaims>(token.as_str()).await;
+        let result = validator
+            .parse::<TokenClaims>(token.as_str(), &vec!["https://example.com".to_string()])
+            .await;
 
         assert!(
             if let ParserError::WrongToken(error) = result.err().unwrap() {
@@ -125,7 +133,9 @@ mod tests {
         let mut claims = TokenClaims::new();
         claims.iss = "https://some.com".to_owned();
         let (token, validator, _server) = setup(&claims);
-        let result = validator.parse::<TokenClaims>(token.as_str()).await;
+        let result = validator
+            .parse::<TokenClaims>(token.as_str(), &vec!["https://example.com".to_string()])
+            .await;
         assert!(
             if let ParserError::WrongToken(error) = result.err().unwrap() {
                 if let ErrorKind::InvalidIssuer = error.into_kind() {
@@ -144,7 +154,9 @@ mod tests {
         let mut claims = TokenClaims::new();
         claims.aud = "other-id".to_owned();
         let (token, validator, _server) = setup(&claims);
-        let result = validator.parse::<TokenClaims>(token.as_str()).await;
+        let result = validator
+            .parse::<TokenClaims>(token.as_str(), &vec!["https://example.com".to_string()])
+            .await;
         assert!(
             if let ParserError::WrongToken(error) = result.err().unwrap() {
                 if let ErrorKind::InvalidAudience = error.into_kind() {

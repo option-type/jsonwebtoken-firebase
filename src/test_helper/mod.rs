@@ -4,10 +4,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use httpmock::MockServer;
 use jsonwebtoken::{Algorithm, EncodingKey, Header};
 use rand::thread_rng;
-use rsa::{PublicKeyParts, RsaPrivateKey};
 use rsa::pkcs1::der::Encodable;
 use rsa::pkcs1::ToRsaPublicKey;
 use rsa::pkcs8::ToPrivateKey;
+use rsa::{PublicKeyParts, RsaPrivateKey};
 use rustls::PrivateKey;
 use serde::{Deserialize, Serialize};
 
@@ -15,7 +15,7 @@ use crate::Parser;
 
 pub const KID: &str = "some-kid";
 pub const CLIENT_ID: &str = "some-client-id";
-pub const EMAIL: &str = "alex@kviring.com";
+pub const EMAIL: &str = "hello@example.com";
 pub const SUB: &str = "11112222333344445555";
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -41,7 +41,7 @@ impl TokenClaims {
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
                 .as_secs(),
-            iss: "https://accounts.google.com".to_owned(),
+            iss: "https://example.com".to_owned(),
             sub: SUB.to_owned(),
         }
     }
@@ -67,7 +67,8 @@ pub fn setup_public_key_server(claims: &TokenClaims) -> (String, MockServer) {
     header.kid = Some(KID.to_owned());
     header.typ = Some("JWT".to_owned());
     let bits = 2048;
-    let private_key = RsaPrivateKey::new(&mut thread_rng(), bits).expect("failed to generate a key");
+    let private_key =
+        RsaPrivateKey::new(&mut thread_rng(), bits).expect("failed to generate a key");
     let der = private_key.to_pkcs8_der().unwrap().to_pem();
     let key = EncodingKey::from_rsa_pem(der.as_bytes()).unwrap();
     let token = jsonwebtoken::encode::<TokenClaims>(&header, &claims, &key).unwrap();
