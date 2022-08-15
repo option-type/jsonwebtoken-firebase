@@ -53,23 +53,19 @@ struct ProviderInternals {
 impl ProviderInternals {
     async fn refresh_keys(&mut self, url: &str) -> Result<(), GoogleKeyProviderError> {
         use GoogleKeyProviderError::{FetchError, ParseError};
-        // just debugs the network error and tosses it into the appropriate keyprovidererror
-        fn convert_err<C, D>(f: C) -> impl Fn(D) -> GoogleKeyProviderError
-        where
-            C: Fn(String) -> GoogleKeyProviderError,
-            D: std::fmt::Debug,
-        {
-            move |e| f(format!("{e:?}"))
-        }
-
-        let r = reqwest::get(url).await.map_err(convert_err(FetchError))?;
+        let format_err = |e| format!("{e:?}");
+        let r = reqwest::get(url)
+            .await
+            .map_err(format_err)
+            .map_err(FetchError)?;
 
         let expiration_time = GooglePublicKeyProvider::parse_expiration_time(r.headers());
 
         let google_keys = r
             .json::<GoogleKeys>()
             .await
-            .map_err(convert_err(ParseError))?;
+            .map_err(format_err)
+            .map_err(ParseError)?;
 
         self.keys.clear();
         self.keys.extend(
@@ -172,11 +168,9 @@ impl GooglePublicKeyProvider {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
-
-    use httpmock::MockServer;
-
     use crate::keys::GooglePublicKeyProvider;
+    use httpmock::MockServer;
+    use std::time::Duration;
 
     #[tokio::test]
     async fn should_parse_keys() {
@@ -240,9 +234,6 @@ mod tests {
 
         tokio::time::sleep(Duration::from_secs(4)).await;
         let key_result = provider.get_key(kid).await;
-        if let Err(ref e) = key_result {
-            dbg!(e);
-        }
         assert!(key_result.is_ok());
     }
 }
