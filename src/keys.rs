@@ -103,13 +103,12 @@ impl GooglePublicKeyProvider {
     }
 
     pub async fn reload(&self) -> Result<(), GoogleKeyProviderError> {
-        // acquire a write lock on the internals. We need to do this because we
-        // are expecting this function actually update the internals, and we will only
-        // skip the write in the very rare
         if self
             .reloading
             .compare_exchange(false, true, SeqCst, SeqCst)
             .is_ok()
+        // use this AtomicBool to basically just imitate non-existant functionality
+        // of a hypothetical RwLock::lock_if_no_queued_writers().
         {
             // we were not reloading, and have now set the reloading flag
             let mut inner = self.locked_internals.write().await;
@@ -121,7 +120,7 @@ impl GooglePublicKeyProvider {
             self.reloading.store(false, SeqCst);
             refresh_res
         } else {
-            // we know that when we did the check 7 lines above that we were in the middle of a
+            // we know that when we did the AtomicBool CAS that we were in the middle of a
             // reload request. Now, we want to wait here until the task that did successfully set
             // obtain the reloading flag is done with its network requests
             let reader = loop {
@@ -135,7 +134,8 @@ impl GooglePublicKeyProvider {
                 if !self.reloading.load(SeqCst) {
                     break handle;
                 }
-                // handle drops here
+                // handle drops here and we try to get it again, hopefully after the other thread
+                // has completed its update of the keys
             };
             reader.last_res.clone()
         }
@@ -149,11 +149,13 @@ impl GooglePublicKeyProvider {
 
     async fn is_expired(&self) -> bool {
         let read_guard = self.locked_internals.read().await;
-        read_guard.expiry.map_or(true, |i| i >= Instant::now())
+        let now = Instant::now();
+        read_guard.expiry.map_or(true, |i| now >= i)
     }
 
     pub async fn get_key(&self, kid: &str) -> Result<DecodingKey, GoogleKeyProviderError> {
-        if self.is_expired().await {
+        let is_expire = self.is_expired().await;
+        if is_expire {
             self.reload().await?
         }
         let read_guard = self.locked_internals.read().await;
@@ -174,7 +176,7 @@ mod tests {
 
     use httpmock::MockServer;
 
-    use crate::keys::{GoogleKeyProviderError, GooglePublicKeyProvider};
+    use crate::keys::GooglePublicKeyProvider;
 
     #[tokio::test]
     async fn should_parse_keys() {
@@ -197,11 +199,8 @@ mod tests {
         });
         let provider = GooglePublicKeyProvider::new(server.url("/"));
 
-        assert!(matches!(provider.get_key(kid).await, Result::Ok(_)));
-        assert!(matches!(
-            provider.get_key("missing-key").await,
-            Result::Err(_)
-        ));
+        assert!(provider.get_key(kid).await.is_ok());
+        assert!(provider.get_key("missing-key").await.is_err());
     }
 
     #[tokio::test]
@@ -225,10 +224,7 @@ mod tests {
 
         let provider = GooglePublicKeyProvider::new(server.url("/"));
         let key_result = provider.get_key(kid).await;
-        assert!(matches!(
-            key_result,
-            Result::Err(GoogleKeyProviderError::KeyNotFound)
-        ));
+        assert!(key_result.is_err());
 
         server_mock.delete();
         let _server_mock = server.mock(|when, then| {
@@ -242,8 +238,11 @@ mod tests {
                 .body(resp);
         });
 
-        std::thread::sleep(Duration::from_secs(4));
+        tokio::time::sleep(Duration::from_secs(4)).await;
         let key_result = provider.get_key(kid).await;
-        assert!(matches!(key_result, Result::Ok(_)));
+        if let Err(ref e) = key_result {
+            dbg!(e);
+        }
+        assert!(key_result.is_ok());
     }
 }
