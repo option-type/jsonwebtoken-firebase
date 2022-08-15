@@ -30,6 +30,7 @@ pub struct GCP;
 
 impl GCP {
     pub const TOKEN_URL: &'static str = "https://www.googleapis.com/oauth2/v3/certs";
+    // const ISSUERS: [&'static str; 2] = ["https://accounts.google.com", "accounts.google.com"];
 }
 
 pub struct Firebase;
@@ -63,6 +64,8 @@ impl Parser<2> {
     }
 }
 
+pub type DefaultParser = Parser<2>;
+
 impl<const N: usize> Parser<N> {
     pub fn new_with_cert_urls(client_id: String, public_key_urls: [&str; N]) -> Self {
         let key_providers: [GooglePublicKeyProvider; N] = public_key_urls
@@ -93,17 +96,30 @@ impl<const N: usize> Parser<N> {
         let header = jsonwebtoken::decode_header(token).map_err(|_| ParserError::WrongHeader)?;
         let kid = header.kid.ok_or(ParserError::UnknownKid)?;
         let kid = kid.as_str();
-        let get_key_tasks = self.key_providers.iter().map(|provider| async move {
-            // raw_res is how we would originally would get the key from a singular
-            // provider. However, since we may have multiple providers, we have
-            // to do this get_key on every provider to see if any of them contain the
-            // auth for us
+        // WTF is going on here you ask? Why isn't this just
+        // `self.key_providers.iter().map(|provider| async move { ...`?
+        //
+        // Good question! The answer is ultimately that rustc is a bit silly, and is unable
+        // to accurately reason about the lifetime of the reference to the provider that we
+        // ultimately end up handing it that way, since Iter::Map passes as input to the closure
+        // a reference with a lifetime equal to that of itself instead of something with the
+        // same lifetime as the struct it borrows from. Normally this is fine, but with async
+        // blocks it's not if you want to hold the closure across and await boundary and have the
+        // returned future be `Send`, since the Map struct lives on the stack and thus if moved
+        // between awaits would mean that the references it handed to the closure are no longer
+        // pointing the the data they want, but to some random spot on the stack, UB!. Of course,
+        // that's not what would actually happen, since we're giving references to key_providers,
+        // which is something that we know isn't going to be moved for the duration of this future.
+        // To explicitly tell the compiler that provider will live for the duration of this future,
+        // we have to obtain a reference to it via a way that gives references with a lifetime of
+        // 'self. Thus, we have to take the reference by indexing the array.
+        let closure = |index: usize| async move {
+            let provider = &self.key_providers[index];
             let key = provider
                 .get_key(kid)
                 .await
                 .map_err(ParserError::KeyProvider)?;
-
-            let aud = vec![self.client_id.to_owned()];
+            let aud = [self.client_id.to_owned()];
             let validation = {
                 let mut v = Validation::new(Algorithm::RS256);
                 v.set_audience(&aud);
@@ -115,7 +131,8 @@ impl<const N: usize> Parser<N> {
             jsonwebtoken::decode::<T>(token, &key, &validation)
                 .map(|token_data| token_data.claims)
                 .map_err(ParserError::WrongToken)
-        });
+        };
+        let get_key_tasks = (0..N).map(closure);
         get_first_success(get_key_tasks).await
     }
 }
