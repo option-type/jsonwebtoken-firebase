@@ -90,9 +90,9 @@ impl Default for ProviderInternals {
 }
 
 impl GooglePublicKeyProvider {
-    pub fn new(public_key_url: String) -> Self {
+    pub fn new<T: Into<String>>(public_key_url: T) -> Self {
         Self {
-            url: public_key_url,
+            url: public_key_url.into(),
             locked_internals: Default::default(),
             reloading: AtomicBool::new(false),
         }

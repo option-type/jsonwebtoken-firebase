@@ -68,16 +68,8 @@ pub type DefaultParser = Parser<2>;
 
 impl<const N: usize> Parser<N> {
     pub fn new_with_cert_urls(client_id: String, public_key_urls: [&str; N]) -> Self {
-        let key_providers: [GooglePublicKeyProvider; N] = public_key_urls
-            .into_iter()
-            .map(String::from)
-            .map(GooglePublicKeyProvider::new)
-            // unfortunately, there's no way to avoid collecting into
-            // a heap-allocated structure before converting into an
-            // array of known size on the stack
-            .collect::<Vec<_>>()
-            .try_into()
-            .unwrap();
+        let key_providers: [GooglePublicKeyProvider; N] =
+            public_key_urls.map(GooglePublicKeyProvider::new);
         Self {
             client_id,
             key_providers,
@@ -176,6 +168,9 @@ impl<const N: usize> Parser<N> {
 /// | B       | 50ms    | Err("uh oh") |
 /// | C       | 25ms    | Err("oops")  |
 /// | A       | 100ms   | Err("IDK")   |
+///
+/// #Panics
+/// if the iterator is empty
 pub async fn get_first_success<I, T, E>(i: I) -> Result<T, E>
 where
     I: IntoIterator,
