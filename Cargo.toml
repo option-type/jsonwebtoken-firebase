@@ -1,5 +1,5 @@
 [package]
-authors = ["Kviring Aleksey <alex@kviring.com>", "Not Scott Wey <not-me@scottwey.com>"]
+authors = ["Kviring Aleksey <alex@kviring.com>", "Not Scott Wey <not-me@scottwey.com>", "Alex Schuler <schulace@gmail.com>"]
 description = "parse and validate google jwt token with jsonwebtoken"
 documentation = "https://docs.rs/jsonwebtoken-google"
 edition = "2021"
