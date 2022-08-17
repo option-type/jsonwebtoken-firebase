@@ -1,12 +1,16 @@
-use std::collections::HashMap;
-use std::time::Instant;
+use std::{
+    collections::HashMap,
+    sync::atomic::{AtomicBool, Ordering::SeqCst},
+    time::Instant,
+};
 
 use headers::Header;
-use jsonwebtoken::DecodingKey;
 use jsonwebtoken::errors::Error;
-use reqwest::header::{CACHE_CONTROL, HeaderMap};
+use jsonwebtoken::DecodingKey;
+use reqwest::header::{HeaderMap, CACHE_CONTROL};
 use serde::Deserialize;
 use thiserror::Error;
+use tokio::sync::RwLock as AsyncRwLock;
 
 #[derive(Deserialize, Clone)]
 pub struct GoogleKeys {
@@ -20,7 +24,7 @@ pub struct GoogleKey {
     e: String,
 }
 
-#[derive(Error, Debug)]
+#[derive(Error, Debug, Clone)]
 pub enum GoogleKeyProviderError {
     #[error("key not found")]
     KeyNotFound,
@@ -35,81 +39,138 @@ pub enum GoogleKeyProviderError {
 #[derive(Debug)]
 pub struct GooglePublicKeyProvider {
     url: String,
+    locked_internals: AsyncRwLock<ProviderInternals>,
+    reloading: AtomicBool,
+}
+
+#[derive(Debug)]
+struct ProviderInternals {
     keys: HashMap<String, GoogleKey>,
-    expiration_time: Option<Instant>,
+    expiry: Option<Instant>,
+    last_res: Result<(), GoogleKeyProviderError>,
+}
+
+impl ProviderInternals {
+    async fn refresh_keys(&mut self, url: &str) -> Result<(), GoogleKeyProviderError> {
+        use GoogleKeyProviderError::{FetchError, ParseError};
+        let format_err = |e| format!("{e:?}");
+        let r = reqwest::get(url)
+            .await
+            .map_err(format_err)
+            .map_err(FetchError)?;
+
+        let expiration_time = GooglePublicKeyProvider::parse_expiration_time(r.headers());
+
+        let google_keys = r
+            .json::<GoogleKeys>()
+            .await
+            .map_err(format_err)
+            .map_err(ParseError)?;
+
+        self.keys.clear();
+        self.keys.extend(
+            google_keys
+                .keys
+                .into_iter()
+                .map(|key| (key.kid.clone(), key)),
+        );
+        self.expiry = expiration_time;
+        Result::Ok(())
+    }
+}
+
+impl Default for ProviderInternals {
+    fn default() -> Self {
+        Self {
+            keys: Default::default(),
+            expiry: None,
+            last_res: Ok(()),
+        }
+    }
 }
 
 impl GooglePublicKeyProvider {
-    pub fn new(public_key_url: &str) -> Self {
+    pub fn new<T: Into<String>>(public_key_url: T) -> Self {
         Self {
-            url: public_key_url.to_owned(),
-            keys: Default::default(),
-            expiration_time: None,
+            url: public_key_url.into(),
+            locked_internals: Default::default(),
+            reloading: AtomicBool::new(false),
         }
     }
 
-    pub async fn reload(&mut self) -> Result<(), GoogleKeyProviderError> {
-        match reqwest::get(&self.url).await {
-            Ok(r) => {
-                let expiration_time = GooglePublicKeyProvider::parse_expiration_time(&r.headers());
-                match r.json::<GoogleKeys>().await {
-                    Ok(google_keys) => {
-                        self.keys.clear();
-                        for key in google_keys.keys.into_iter() {
-                            self.keys.insert(key.kid.clone(), key);
-                        }
-                        self.expiration_time = expiration_time;
-                        Result::Ok(())
-                    }
-                    Err(e) => Result::Err(GoogleKeyProviderError::ParseError(format!("{:?}", e))),
+    pub async fn reload(&self) -> Result<(), GoogleKeyProviderError> {
+        if self
+            .reloading
+            .compare_exchange(false, true, SeqCst, SeqCst)
+            .is_ok()
+        // use this AtomicBool to basically just imitate non-existant functionality
+        // of a hypothetical RwLock::lock_if_no_queued_writers().
+        {
+            // we were not reloading, and have now set the reloading flag
+            let mut inner = self.locked_internals.write().await;
+            let refresh_res = inner.refresh_keys(&self.url).await;
+            inner.last_res = refresh_res.clone();
+            // we should drop the write handle before we indicate that the reload is complete, or
+            // we run a small risk of running this block twice when we don't have to
+            drop(inner);
+            self.reloading.store(false, SeqCst);
+            refresh_res
+        } else {
+            // we know that when we did the AtomicBool CAS that we were in the middle of a
+            // reload request. Now, we want to wait here until the task that did successfully set
+            // obtain the reloading flag is done with its network requests
+            let reader = loop {
+                // try to grab a reader to the keys. If the above block is currently writing, then
+                // this will wait until it's done
+                let handle = self.locked_internals.read().await;
+                // IMPORTANT: in the event that a different task successfully sets reloading, but
+                // we obtain the read lock before it can acquire the write lock, we need to release
+                // our handle because the data is stale/expired and the updater needs us to drop
+                // our handle before it can proceed
+                if !self.reloading.load(SeqCst) {
+                    break handle;
                 }
-            }
-            Err(e) => Result::Err(GoogleKeyProviderError::FetchError(format!("{:?}", e))),
+                // handle drops here and we try to get it again, hopefully after the other thread
+                // has completed its update of the keys
+            };
+            reader.last_res.clone()
         }
     }
 
     fn parse_expiration_time(header_map: &HeaderMap) -> Option<Instant> {
-        match headers::CacheControl::decode(&mut header_map.get_all(CACHE_CONTROL).iter()) {
-            Ok(header) => match header.max_age() {
-                None => None,
-                Some(max_age) => Some(Instant::now() + max_age),
-            },
-            Err(_) => None,
-        }
+        headers::CacheControl::decode(&mut header_map.get_all(CACHE_CONTROL).iter())
+            .ok()
+            .and_then(|header| header.max_age().map(|age| Instant::now() + age))
     }
 
-    pub fn is_expire(&self) -> bool {
-        if let Some(expire) = self.expiration_time {
-            Instant::now() > expire
-        } else {
-            false
-        }
+    async fn is_expired(&self) -> bool {
+        let read_guard = self.locked_internals.read().await;
+        let now = Instant::now();
+        read_guard.expiry.map_or(true, |i| now >= i)
     }
 
-    pub async fn get_key(
-        &mut self,
-        kid: &str,
-    ) -> Result<DecodingKey, GoogleKeyProviderError> {
-        if self.expiration_time.is_none() || self.is_expire() {
+    pub async fn get_key(&self, kid: &str) -> Result<DecodingKey, GoogleKeyProviderError> {
+        let is_expire = self.is_expired().await;
+        if is_expire {
             self.reload().await?
         }
-        match self.keys.get(&kid.to_owned()) {
-            None => Result::Err(GoogleKeyProviderError::KeyNotFound),
-            Some(key) => {
-                DecodingKey::from_rsa_components(key.n.as_str(), key.e.as_str()).map_err(|e|
-                    GoogleKeyProviderError::CreateKeyError(e))
-            }
-        }
+        let read_guard = self.locked_internals.read().await;
+        read_guard
+            .keys
+            .get(kid)
+            .ok_or(GoogleKeyProviderError::KeyNotFound)
+            .and_then(|key| {
+                DecodingKey::from_rsa_components(key.n.as_str(), key.e.as_str())
+                    .map_err(GoogleKeyProviderError::CreateKeyError)
+            })
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
-
+    use crate::keys::GooglePublicKeyProvider;
     use httpmock::MockServer;
-
-    use crate::keys::{GoogleKeyProviderError, GooglePublicKeyProvider};
+    use std::time::Duration;
 
     #[tokio::test]
     async fn should_parse_keys() {
@@ -130,13 +191,10 @@ mod tests {
                 .header("Content-Type", "application/json; charset=UTF-8")
                 .body(resp);
         });
-        let mut provider = GooglePublicKeyProvider::new(server.url("/").as_str());
+        let provider = GooglePublicKeyProvider::new(server.url("/"));
 
-        assert!(matches!(provider.get_key(kid).await, Result::Ok(_)));
-        assert!(matches!(
-            provider.get_key("missing-key").await,
-            Result::Err(_)
-        ));
+        assert!(provider.get_key(kid).await.is_ok());
+        assert!(provider.get_key("missing-key").await.is_err());
     }
 
     #[tokio::test]
@@ -158,12 +216,9 @@ mod tests {
                 .body("{\"keys\":[]}");
         });
 
-        let mut provider = GooglePublicKeyProvider::new(server.url("/").as_str());
+        let provider = GooglePublicKeyProvider::new(server.url("/"));
         let key_result = provider.get_key(kid).await;
-        assert!(matches!(
-            key_result,
-            Result::Err(GoogleKeyProviderError::KeyNotFound)
-        ));
+        assert!(key_result.is_err());
 
         server_mock.delete();
         let _server_mock = server.mock(|when, then| {
@@ -177,8 +232,8 @@ mod tests {
                 .body(resp);
         });
 
-        std::thread::sleep(Duration::from_secs(4));
+        tokio::time::sleep(Duration::from_secs(4)).await;
         let key_result = provider.get_key(kid).await;
-        assert!(matches!(key_result, Result::Ok(_)));
+        assert!(key_result.is_ok());
     }
 }

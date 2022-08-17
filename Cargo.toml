@@ -1,8 +1,8 @@
 [package]
-authors = ["Kviring Aleksey <alex@kviring.com>", "Not Scott Wey <not-me@scottwey.com>"]
+authors = ["Kviring Aleksey <alex@kviring.com>", "Not Scott Wey <not-me@scottwey.com>", "Alex Schuler <schulace@gmail.com>"]
 description = "parse and validate google jwt token with jsonwebtoken"
 documentation = "https://docs.rs/jsonwebtoken-google"
-edition = "2018"
+edition = "2021"
 keywords = ["firebase", "jwt", "sign", "token", "android"]
 license = "MIT/Apache-2.0"
 name = "jsonwebtoken-firebase"
@@ -14,6 +14,7 @@ version = "0.1.6"
 
 [dependencies]
 base64 = {version = "0.13.0", optional = true}
+futures = "0.3.21"
 headers = "0.3.1"
 httpmock = {version = "0.6.2", optional = true}
 jsonwebtoken = "8.0.1"
